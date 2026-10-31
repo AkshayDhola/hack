@@ -6,7 +6,7 @@ Every step from the reference to the final version, each with the live-board run
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
 | 1 | Index only the query terms, on forked workers; phrases answered per range; heavy BOOL queries as bitsets; light ones on whole-corpus sets | RUN_142bc06 | 4.901 | 912 | 26.3 |
-| 2 | Debian's statically linked CPython 3.13 | RUN_bed61e9 | | | |
+| 2 | Debian's statically linked CPython 3.13 | run-d46857566005 | 4.278 | 900 | 27.8 |
 
 ## What each step did
 

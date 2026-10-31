@@ -6,7 +6,7 @@ Every step from the reference to the final version, each with the live-board run
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
 | 1 | One regex per record, forked workers over record-aligned ranges, flat region table, distinct names in a second phase | RUN_142bc06 | 1.016 | 243 | 28.4 |
-| 2 | Debian's statically linked CPython 3.13; 256 KB pieces | RUN_bed61e9 | | | |
+| 2 | Debian's statically linked CPython 3.13; 256 KB pieces | run-84ebeee3d5f4 | 0.835 | 207 | 31.8 |
 | 3 | numpy: whole pieces parsed vectorised, no per-record Python | RUN_numpy | | | |
 
 ## What each step did

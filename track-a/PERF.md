@@ -7,7 +7,7 @@ Every step from the reference to the final version, each with the live-board run
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | Forked workers over line-aligned ranges, `bytes.split`, hour as a byte prefix, `array('I')` latencies, partitioned merge | RUN_142bc06 | 0.715 | 127 | 40.5 |
 | 2 | Latency `int` straight into the key's array, no per-piece lists | RUN_9e288ac | | | |
-| 3 | Debian's statically linked CPython 3.13; 128 KB pieces | RUN_bed61e9 | | | |
+| 3 | Debian's statically linked CPython 3.13; 128 KB pieces | run-ba96ef4b42ca | 0.477 | 108 | 46.3 |
 
 ## What each step did
 

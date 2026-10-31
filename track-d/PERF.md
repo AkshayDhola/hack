@@ -7,7 +7,7 @@ Every step from the reference to the final version, each with the live-board run
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Parse, build and query on forked workers; graph as CSR in shared mmaps; bidirectional Dijkstra on packed int keys | RUN_142bc06 | 3.511 | 353 | 31.1 |
 | 2 | Typed arrays in the build; stop test skipped until a path exists | RUN_9e288ac | | | |
-| 3 | Debian's statically linked CPython 3.13; JSON-scanner int parsing; 512 KB pieces | RUN_bed61e9 | | | |
+| 3 | Debian's statically linked CPython 3.13; JSON-scanner int parsing; 512 KB pieces | run-3105f90c1a55 | 2.691 | 320 | 34.7 |
 
 ## What each step did
 
