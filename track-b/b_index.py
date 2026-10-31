@@ -59,24 +59,21 @@ def fork_map(func, items):
     pipes = []
     for item in items:
         r, w = os.pipe()
-        if not os.fork():
-            code = 1
+        if not os.fork():  # child: send the result; exit 1 if func raised
             try:
-                os.close(r)
                 with open(w, "wb") as f:
                     marshal.dump(func(item), f)
-                code = 0
+                os._exit(0)
             finally:
-                os._exit(code)
+                os._exit(1)
         os.close(w)
         pipes.append(r)
     out = []
     for r in pipes:
         with open(r, "rb") as f:
-            out.append(marshal.loads(f.read()))
-    for _ in pipes:
-        if os.wait()[1]:
-            raise RuntimeError("worker failed")
+            out.append(marshal.loads(f.read()))  # one read: load(f) reads per object
+    if any(os.wait()[1] for _ in pipes):
+        raise RuntimeError("worker failed")
     return out
 
 
@@ -331,7 +328,7 @@ def spans(fd, size, parts):
     return [(a, b) for a, b in zip(bounds, bounds[1:]) if a < b]
 
 
-def main(data_dir, out_dir):
+def main(data_dir="/data", out_dir="/out"):
     gc.disable()  # no reference cycles: skip collector passes over millions of objects
     global _fd, _bool_terms, _phrases, _anchors, _postings, _bools, _heavy, _light_terms
     _fd = os.open(os.path.join(data_dir, DOCS_FILE), os.O_RDONLY)
@@ -374,10 +371,7 @@ def main(data_dir, out_dir):
 
 
 if __name__ == "__main__":
-    import argparse  # CLI only: the container calls main() directly, so skip this import there
+    import sys
 
-    parser = argparse.ArgumentParser(description="Track B (Index) optimized implementation.")
-    parser.add_argument("--data", default="/data")
-    parser.add_argument("--out", default="/out")
-    args = parser.parse_args()
-    main(args.data, args.out)
+    flags = dict(zip(sys.argv[1::2], sys.argv[2::2]))  # --data DIR --out DIR
+    main(flags.get("--data", "/data"), flags.get("--out", "/out"))

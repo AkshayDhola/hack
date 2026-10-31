@@ -44,7 +44,7 @@ _shift = 1
 _span = 1  # nodes per build bucket
 _slots = []  # per parse range: (fwd nodes, fwd edges, rev nodes, rev edges) views into scratch
 _counts = []  # per parse range: [fwd edges per bucket, rev edges per bucket]
-_bases = ([], [])  # per direction, first edge slot of each bucket in the graph map
+_bases = [[], []]  # per direction, first edge slot of each bucket in the graph map
 _csr = ()  # (fwd offsets, fwd edges, rev offsets, rev edges): views into the graph map
 _tasks = []  # distinct (s, t) with s != t
 _per = 1  # tasks per queue record
@@ -56,25 +56,27 @@ def fork_map(func, items):
     pipes = []
     for item in items:
         r, w = os.pipe()
-        if not os.fork():
-            code = 1
+        if not os.fork():  # child: send the result; exit 1 if func raised
             try:
-                os.close(r)
                 with open(w, "wb") as f:
                     marshal.dump(func(item), f)
-                code = 0
+                os._exit(0)
             finally:
-                os._exit(code)
+                os._exit(1)
         os.close(w)
         pipes.append(r)
     out = []
     for r in pipes:
         with open(r, "rb") as f:
-            out.append(marshal.load(f))
-    for _ in pipes:
-        if os.wait()[1]:
-            raise RuntimeError("worker failed")
+            out.append(marshal.loads(f.read()))  # one read: load(f) reads per object
+    if any(os.wait()[1] for _ in pipes):
+        raise RuntimeError("worker failed")
     return out
+
+
+def views(buf, cuts):
+    """(uint32, uint64, uint32, uint64) views of buf between consecutive byte offsets."""
+    return [buf[a:b].cast(t) for a, b, t in zip(cuts, cuts[1:], "IQIQ")]
 
 
 def spans(fd, start, end, parts):
@@ -115,8 +117,8 @@ def parse(job):
             bea[j](w | u)
     for view, arrays in zip(_slots[c], (fk, fe, bk, be)):
         at = 0
-        for a in arrays:
-            view[at:at + len(a)] = a
+        for a in arrays:  # copy straight into the slot: no joined temporary
+            view[at : at + len(a)] = a
             at += len(a)
     return [list(map(len, fk)), list(map(len, bk))]
 
@@ -126,17 +128,16 @@ def build(j):
     lo = j * _span
     rows = min(_n, lo + _span) - lo
     for d, offsets, edges in ((0, _csr[0], _csr[1]), (1, _csr[2], _csr[3])):
-        parts = []
-        for slot, counts in zip(_slots, _counts):
-            at = sum(counts[d][:j])
-            parts.append((slot[2 * d][at:at + counts[d][j]], slot[2 * d + 1][at:at + counts[d][j]]))
-        degree = [0] * rows
+        # This bucket's (node, edge) pairs in every parse slot.
+        at = [(sum(c[d][:j]), sum(c[d][: j + 1])) for c in _counts]
+        parts = [(s[2 * d][a:b], s[2 * d + 1][a:b]) for s, (a, b) in zip(_slots, at)]
+        degree = array("I", bytes(4 * rows))
         for nodes, _ in parts:
             for k in nodes:
                 degree[k] += 1
         # Row starts; the last one is the next bucket's base, which it writes too.
-        pos = list(accumulate(degree, initial=_bases[d][j]))
-        offsets[lo:lo + rows + 1] = array("I", pos)
+        pos = array("I", accumulate(degree, initial=_bases[d][j]))
+        offsets[lo : lo + rows + 1] = pos
         for nodes, encoded in parts:
             for k, e in zip(nodes, encoded):
                 edges[pos[k]] = e
@@ -159,7 +160,8 @@ def distance(s, t):
     hb = [t]
     mu = INF
     while hf and hb:
-        if (hf[0] >> shift) + (hb[0] >> shift) >= mu:
+        # Stop once no unsettled pair can beat mu (skipped until a path is known: -4%).
+        if mu < INF and (hf[0] >> shift) + (hb[0] >> shift) >= mu:
             break
         if len(hf) <= len(hb):
             x = heappop(hf)
@@ -204,7 +206,7 @@ def answer(_):
     return out
 
 
-def main(data_dir, out_dir):
+def main(data_dir="/data", out_dir="/out"):
     global _fd, _n, _shift, _span, _slots, _counts, _bases, _csr, _tasks, _per, _queue
     gc.disable()  # no reference cycles: skip collector passes over millions of objects
 
@@ -226,8 +228,7 @@ def main(data_dir, out_dir):
         view = memoryview(scratch)
         at = 0
         for cap in caps:
-            _slots.append((view[at:at + 4 * cap].cast("I"), view[at + 4 * cap:at + 12 * cap].cast("Q"),
-                           view[at + 12 * cap:at + 16 * cap].cast("I"), view[at + 16 * cap:at + 24 * cap].cast("Q")))
+            _slots.append(views(view, [at + x * cap for x in (0, 4, 12, 16, 24)]))
             at += 24 * cap
         _counts = fork_map(parse, enumerate(ranges))
     finally:
@@ -235,14 +236,14 @@ def main(data_dir, out_dir):
         _fd = -1
 
     buckets = -(-n // _span)
-    _bases = tuple([0, *accumulate(sum(c[d][j] for c in _counts) for j in range(buckets))] for d in (0, 1))
+    sizes = [[sum(c[d][j] for c in _counts) for j in range(buckets)] for d in (0, 1)]
+    _bases = [[0, *accumulate(b)] for b in sizes]
     m = _bases[0][-1]
     # Graph map: offsets (n + 1 uint32, padded to 8 bytes) then edges (m uint64), per direction.
     off_bytes = -(-(n + 1) * 4 // 8) * 8
     half = off_bytes + 8 * m
     graph = memoryview(mmap.mmap(-1, 2 * half))
-    _csr = (graph[:off_bytes].cast("I"), graph[off_bytes:half].cast("Q"),
-            graph[half:half + off_bytes].cast("I"), graph[half + off_bytes:].cast("Q"))
+    _csr = views(graph, [0, off_bytes, half, half + off_bytes, 2 * half])
     fork_map(build, range(buckets))
     _slots = []
     view.release()
@@ -262,7 +263,8 @@ def main(data_dir, out_dir):
         _per = -(-len(_tasks) // QUEUE_SLOTS)
         records = -(-len(_tasks) // _per)
         _queue, w = os.pipe()
-        os.write(w, array("I", range(records)).tobytes())  # fits the empty pipe: no blocking
+        # Fits the empty pipe, so this never blocks.
+        os.write(w, array("I", range(records)).tobytes())
         os.close(w)
         found = [0] * len(_tasks)
         for part in fork_map(answer, range(min(workers, records))):
@@ -277,10 +279,7 @@ def main(data_dir, out_dir):
 
 
 if __name__ == "__main__":
-    import argparse  # CLI only: the container calls main() directly, so skip this import there
+    import sys
 
-    parser = argparse.ArgumentParser(description="Track D (Traverse) optimized implementation.")
-    parser.add_argument("--data", default="/data", help="directory holding graph.txt and queries.txt")
-    parser.add_argument("--out", default="/out", help="directory to write distances.txt into")
-    args = parser.parse_args()
-    main(args.data, args.out)
+    flags = dict(zip(sys.argv[1::2], sys.argv[2::2]))  # --data DIR --out DIR
+    main(flags.get("--data", "/data"), flags.get("--out", "/out"))

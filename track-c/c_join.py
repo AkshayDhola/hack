@@ -18,6 +18,7 @@ from itertools import repeat
 RECORDS_FILE = "records.csv"
 REGIONS_FILE = "regions.csv"
 OUTPUT_FILE = "aggregates.txt"
+HEADER = b"id,name,note,region_id,amount"
 UNMATCHED = b"_UNMATCHED"
 PIECE = 1 << 20
 SPLIT_MIN = 1 << 20
@@ -29,8 +30,8 @@ SPLIT_MIN = 1 << 20
 # without its dot is its cents.
 # Possessive quantifiers (*+, ++): no backtracking into a matched field or number.
 FIELD = rb'(?:"([^"]*+(?:""[^"]*+)*+)"|)'
-RECORD = re.compile(rb"(?:\xef\xbb\xbf)?([0-9]++)," + FIELD + b"," + FIELD
-                    + rb",([0-9]++),(-?[0-9]++\.[0-9]{2})(?:\r?\n|\Z)")
+TAIL = rb",([0-9]++),(-?[0-9]++\.[0-9]{2})(?:\r?\n|\Z)"  # region id, amount, terminator
+RECORD = re.compile(rb"(?:\xef\xbb\xbf)?([0-9]++)," + FIELD + b"," + FIELD + TAIL)
 # A record starts at a line start with a digit or a BOM. Continuation lines of a
 # multi-line note are lowercase words, so they never look like one.
 RECORD_START = re.compile(rb"\n(?=[0-9]|\xef\xbb\xbf)")
@@ -47,24 +48,21 @@ def fork_map(func, items):
     pipes = []
     for item in items:
         r, w = os.pipe()
-        if not os.fork():
-            code = 1
+        if not os.fork():  # child: send the result; exit 1 if func raised
             try:
-                os.close(r)
                 with open(w, "wb") as f:
                     marshal.dump(func(item), f)
-                code = 0
+                os._exit(0)
             finally:
-                os._exit(code)
+                os._exit(1)
         os.close(w)
         pipes.append(r)
     out = []
     for r in pipes:
         with open(r, "rb") as f:
-            out.append(marshal.loads(f.read()))
-    for _ in pipes:
-        if os.wait()[1]:
-            raise RuntimeError("worker failed")
+            out.append(marshal.loads(f.read()))  # one read: load(f) reads per object
+    if any(os.wait()[1] for _ in pipes):
+        raise RuntimeError("worker failed")
     return out
 
 
@@ -80,16 +78,15 @@ def last_record_start(buf):
 
 
 def aggregate(recs):
-    """Records of one country -> partial aggregates; names stay one NUL-joined blob."""
+    """Records of one country -> [count, id sum, cents sum, min, max, name bytes, note bytes, [names]]."""
     ids, names, notes, _, amounts = zip(*recs)
     cents = list(map(int, map(bytes.replace, amounts, repeat(b"."), repeat(b""))))
+    names = b"\0".join(names)
     notes = b"\0".join(notes)
-    joined = b"\0".join(names)
-    n = len(recs)
-    # Escaped length minus one byte per "" pair; \0 separators keep pairs apart.
-    return [n, sum(map(int, ids)), sum(cents), min(cents), max(cents),
-            len(joined) - (n - 1) - joined.count(b'""'),
-            len(notes) - (n - 1) - notes.count(b'""'), [joined]]
+    gaps = len(recs) - 1  # \0 separators
+    stats = [len(recs), sum(map(int, ids)), sum(cents), min(cents), max(cents)]
+    # Escaped length minus the separators and one byte per "" pair (\0 keeps pairs apart).
+    return stats + [len(t) - gaps - t.count(b'""') for t in (names, notes)] + [[names]]
 
 
 def merge(totals, part):
@@ -178,18 +175,19 @@ def load_regions(path):
     countries = [UNMATCHED, *set(codes)]
     size = max(ids, default=0) + 1
     # One byte per id while indexes fit, else two.
-    table = bytearray(size) if len(countries) <= 256 else memoryview(bytearray(2 * size)).cast("H")
-    any(map(table.__setitem__, ids, map({c: i for i, c in enumerate(countries)}.__getitem__, codes)))
+    table = bytearray(size)
+    if len(countries) > 256:
+        table = memoryview(bytearray(2 * size)).cast("H")
+    index = {c: i for i, c in enumerate(countries)}
+    any(map(table.__setitem__, ids, map(index.__getitem__, codes)))
     return table, countries
 
 
-def format_cents(cents):
-    sign = "-" if cents < 0 else ""
-    cents = abs(cents)
-    return f"{sign}{cents // 100}.{cents % 100:02d}"
+def format_cents(c):
+    return f"{'-' if c < 0 else ''}{abs(c) // 100}.{abs(c) % 100:02d}"
 
 
-def main(data_dir, out_dir):
+def main(data_dir="/data", out_dir="/out"):
     gc.disable()  # no reference cycles: skip collector passes over millions of objects
     global _fd, _table, _blobs
     _table, countries = load_regions(os.path.join(data_dir, REGIONS_FILE))
@@ -197,7 +195,7 @@ def main(data_dir, out_dir):
     size = os.fstat(_fd).st_size
     header = os.pread(_fd, 64, 0)
     skip = header.find(b"\n") + 1
-    if header[:skip].removeprefix(b"\xef\xbb\xbf").rstrip(b"\r\n") != b"id,name,note,region_id,amount":
+    if header[:skip].removeprefix(b"\xef\xbb\xbf").rstrip(b"\r\n") != HEADER:
         raise ValueError("unexpected records.csv header")
     workers = len(os.sched_getaffinity(0))
     totals = {}
@@ -216,24 +214,20 @@ def main(data_dir, out_dir):
         loads[j] += sum(map(len, _blobs[k]))
         chunks[j].append(k)
     chunks = [c for c in chunks if c]
-    distinct = dict(zip([k for c in chunks for k in c],
-                        [n for counts in fork_map(count_names, chunks) for n in counts]))
+    distinct = dict(zip(sum(chunks, []), sum(fork_map(count_names, chunks), [])))
     _blobs = {}
     lines = []
     for key in keys:
-        n, id_sum, amt, lo, hi, name_bytes, note_bytes = totals[key]
-        lines.append(f"{key.decode()} {n} {id_sum} {format_cents(amt)} {format_cents(lo)} "
-                     f"{format_cents(hi)} {distinct[key]} {name_bytes} {note_bytes}\n")
+        n, ids, amount, lo, hi, name_bytes, note_bytes = totals[key]
+        head = f"{key.decode()} {n} {ids} {format_cents(amount)} {format_cents(lo)} {format_cents(hi)}"
+        lines.append(f"{head} {distinct[key]} {name_bytes} {note_bytes}\n")
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, OUTPUT_FILE), "wb") as f:
         f.write("".join(lines).encode())
 
 
 if __name__ == "__main__":
-    import argparse  # CLI only: the container calls main() directly, so skip this import there
+    import sys
 
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--data", default="/data")
-    ap.add_argument("--out", default="/out")
-    args = ap.parse_args()
-    main(args.data, args.out)
+    flags = dict(zip(sys.argv[1::2], sys.argv[2::2]))  # --data DIR --out DIR
+    main(flags.get("--data", "/data"), flags.get("--out", "/out"))
