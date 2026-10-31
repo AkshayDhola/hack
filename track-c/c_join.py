@@ -4,16 +4,21 @@
     python3.13 c_join.py [--data /data] [--out /out]
 
 Reads records.csv and regions.csv and writes aggregates.txt (specs/c-join.md).
-One regex parses whole records in C. The file is cut into one range per CPU at
-record starts; forked workers read their range in small pieces, bucket records
-by country and aggregate each bucket with C-level sum/min/max/set. The parent
-merges per-country partials.
+The file is cut into one range per CPU at record starts; forked workers read their
+range in small pieces and parse each piece with numpy (vendored in ./vendor), no
+per-record Python: quote parity marks the commas and LFs outside quotes, the
+numbers are read with vectorized digit arithmetic and the per-country stats are
+summed with bincount and ufunc.at. The parent merges per-country partials; the
+distinct names are counted per country in a second forked phase.
 """
 import gc
 import marshal
 import os
 import re
-from itertools import repeat
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+import numpy as np  # noqa: E402
 
 RECORDS_FILE = "records.csv"
 REGIONS_FILE = "regions.csv"
@@ -23,15 +28,7 @@ UNMATCHED = b"_UNMATCHED"
 PIECE = 256 << 10  # piece size: 256 KB beat 512 KB and 1 MB (time and memory)
 SPLIT_MIN = 1 << 20
 
-# id, name, note, region_id, amount. Spec 2.2: a non-empty name or note is
-# always quoted, so a text field is either empty or quoted and one group holds
-# its still-escaped inner bytes. Ids, region ids and amounts are never quoted and
-# have no leading zeros, so region ids are compared as bytes and an amount
-# without its dot is its cents.
-# Possessive quantifiers (*+, ++): no backtracking into a matched field or number.
-FIELD = rb'(?:"([^"]*+(?:""[^"]*+)*+)"|)'
-TAIL = rb",([0-9]++),(-?[0-9]++\.[0-9]{2})(?:\r?\n|\Z)"  # region id, amount, terminator
-RECORD = re.compile(rb"(?:\xef\xbb\xbf)?([0-9]++)," + FIELD + b"," + FIELD + TAIL)
+POW10 = 10 ** np.arange(19, dtype=np.int64)
 # A record starts at a line start with a digit or a BOM. Continuation lines of a
 # multi-line note are lowercase words, so they never look like one.
 RECORD_START = re.compile(rb"\n(?=[0-9]|\xef\xbb\xbf)")
@@ -77,16 +74,65 @@ def last_record_start(buf):
     return -1
 
 
-def aggregate(recs):
-    """Records of one country -> [count, id sum, cents sum, min, max, name bytes, note bytes, [names]]."""
-    ids, names, notes, _, amounts = zip(*recs)
-    cents = list(map(int, map(bytes.replace, amounts, repeat(b"."), repeat(b""))))
-    names = b"\0".join(names)
-    notes = b"\0".join(notes)
-    gaps = len(recs) - 1  # \0 separators
-    stats = [len(recs), sum(map(int, ids)), sum(cents), min(cents), max(cents)]
-    # Escaped length minus the separators and one byte per "" pair (\0 keeps pairs apart).
-    return stats + [len(t) - gaps - t.count(b'""') for t in (names, notes)] + [[names]]
+def number(a, s, e):
+    """Decimal digits a[s:e] -> int64 per row, right to left: one gather per digit place."""
+    n = e - s
+    v = np.zeros(len(s), np.int64)
+    for k in range(int(n.max(initial=0))):
+        digit = a[np.maximum(e - 1 - k, 0)].astype(np.int64) - 48
+        v += np.where(n > k, digit * POW10[k], 0)
+    return v
+
+
+def scan(piece, table, acc, names):
+    """Whole records -> per-country stats added into acc, inner name bytes into names."""
+    a = np.frombuffer(piece, np.uint8)
+    # Quotes so far. Spec 2.1: a quote only occurs in a quoted field, so a byte is
+    # outside quotes when the count is even. uint16 wraps, harmlessly: only the parity
+    # and differences across one field are used.
+    quotes = np.cumsum(a == 34, dtype=np.uint16)
+    outside = (quotes & 1) == 0
+    lf = np.flatnonzero((a == 10) & outside)  # record terminators
+    if piece[-1:] != b"\n":
+        lf = np.append(lf, len(a))  # the final record may lack its terminator
+    start = np.concatenate(([0], lf[:-1] + 1))
+    start += 3 * (a[start] == 0xEF)  # a BOM can only start a record (ids are digits)
+    commas = np.flatnonzero((a == 44) & outside)
+    if len(commas) != 4 * len(lf):
+        raise ValueError("malformed record in records.csv")
+    c0, c1, c2, c3 = commas.reshape(-1, 4).T
+    end = lf - (a[lf - 1] == 13)  # drop the CR of a CRLF
+    neg = a[c3 + 1] == 45
+    cents = number(a, c3 + 1 + neg, end - 3) * 100 + number(a, end - 2, end)
+    cents = np.where(neg, -cents, cents)
+    region = number(a, c2 + 1, c3)
+    key = np.where(region < len(table), table[np.minimum(region, len(table) - 1)], 0)
+    key = key.astype(np.intp)
+
+    def unescaped(s, e):  # quoted: minus both delimiters and one byte per "" pair
+        q = (quotes[e - 1] - quotes[s - 1]).astype(np.int64)
+        return e - s - q // 2 - (q > 0)
+
+    count, ids, total, lo, hi, name_bytes, note_bytes = acc
+    count += np.bincount(key, minlength=len(count))
+    np.add.at(ids, key, number(a, start, c0))
+    np.add.at(total, key, cents)
+    np.minimum.at(lo, key, cents)
+    np.maximum.at(hi, key, cents)
+    np.add.at(name_bytes, key, unescaped(c0 + 1, c1))
+    np.add.at(note_bytes, key, unescaped(c1 + 1, c2))
+    # Inner (still escaped) name bytes, \0-separated and grouped by country, in one gather.
+    quoted = a[c0 + 1] == 34
+    order = np.argsort(key, kind="stable")
+    s, e, key = (c0 + 1 + quoted)[order], (c1 - quoted)[order], key[order]
+    size = e - s + 1  # the name and its \0
+    ends = np.cumsum(size)
+    idx = np.repeat(s - (ends - size), size) + np.arange(ends[-1])
+    idx[ends - 1] = len(a)  # each \0: the zero byte appended below
+    blob = np.append(a, np.uint8(0))[idx].tobytes()
+    cuts = [0, *(np.flatnonzero(key[1:] != key[:-1]) + 1).tolist(), len(key)]
+    for i, j in zip(cuts, cuts[1:]):
+        names.setdefault(int(key[i]), []).append(blob[ends[i] - size[i] : ends[j - 1] - 1])
 
 
 def merge(totals, part):
@@ -103,15 +149,20 @@ def merge(totals, part):
         t[4] = max(t[4], p[4])
         t[5] += p[5]
         t[6] += p[6]
-        if len(p) > 7:
-            t[7] += p[7]
 
 
 def work(span):
+    """Phase 1: one range -> ({country: [count, id sum, cents sum, min, max, name bytes,
+    note bytes]}, {country: \0-joined inner name bytes})."""
     start, end = span
-    totals = {}
+    table = np.frombuffer(_table, np.uint16 if isinstance(_table, memoryview) else np.uint8)
+    k = int(table.max()) + 1
+    big = 1 << 62
+    acc = [np.zeros(k, np.int64) for _ in range(3)]
+    acc += [np.full(k, big, np.int64), np.full(k, -big, np.int64)]
+    acc += [np.zeros(k, np.int64) for _ in range(2)]
+    names = {}
     rest = b""
-    table = _table
     while start < end:
         n = min(PIECE, end - start)
         buf = rest + os.pread(_fd, n, start)
@@ -121,21 +172,11 @@ def work(span):
             rest = buf
             continue
         rest = buf[cut:]
-        buckets = {}
-        for rec in RECORD.findall(buf, 0, cut):
-            try:
-                key = table[int(rec[3])]
-            except IndexError:  # id above the lookup's range
-                key = 0
-            try:
-                buckets[key].append(rec)
-            except KeyError:
-                buckets[key] = [rec]
-        merge(totals, {k: aggregate(v) for k, v in buckets.items()})
+        scan(buf[:cut], table, acc, names)
+    totals = {int(c): [int(x[c]) for x in acc] for c in np.flatnonzero(acc[0])}
     # One \0-joined blob per country pickles far faster than a set of bytes.
     # Names are deduplicated once per country in phase 2, not in growing per-worker sets.
-    names = {k: b"\0".join(t.pop()) for k, t in totals.items()}
-    return totals, names
+    return totals, {c: b"\0".join(blobs) for c, blobs in names.items()}
 
 
 def count_names(keys):

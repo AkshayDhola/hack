@@ -7,6 +7,10 @@ COPY --from=py /usr/bin/python3.13 /usr/bin/
 COPY --from=py /usr/lib/python3.13 /usr/lib/python3.13
 COPY --from=py /usr/lib/x86_64-linux-gnu/libexpat.so.1 /usr/lib/x86_64-linux-gnu/
 COPY c_join.py /app/
+# numpy 2.5.4 as pip installed it (with its .dist-info), vendored: builds have no network.
+COPY vendor /app/vendor
+# OpenBLAS is never called: one thread, so loading numpy starts no thread pool before the fork.
+ENV OPENBLAS_NUM_THREADS=1
 # The run is read-only and the image ships no stdlib bytecode: compile everything now, so no
 # module is compiled on every start. unchecked-hash: no source stat per import.
 RUN python3.13 -m compileall -q --invalidation-mode unchecked-hash /usr/lib/python3.13 /app

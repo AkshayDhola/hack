@@ -27,7 +27,7 @@ import mmap
 import os
 from array import array
 from heapq import heappop, heappush
-from itertools import accumulate
+from itertools import accumulate, pairwise
 
 GRAPH_FILE = "graph.txt"
 QUERIES_FILE = "queries.txt"
@@ -91,7 +91,7 @@ def spans(fd, start, end, parts):
             break
         bounds.append(pos + nl + 1)
     bounds.append(end)
-    return [(a, b) for a, b in zip(bounds, bounds[1:]) if a < b]
+    return [(a, b) for a, b in pairwise(bounds) if a < b]
 
 
 def parse(job):
