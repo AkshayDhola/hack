@@ -19,12 +19,13 @@ import gc
 import marshal
 import os
 from array import array
+from itertools import pairwise
 
 INPUT_NAME = "requests.log"
 OUTPUT_NAME = "summary.txt"
 LINE = b"%s:00:00Z %s %d %d %d %d %d %d\n"  # hour, endpoint, count, p50, p95, p99, 5xx, ppm
 
-SUB_CHUNK = 256 << 10
+SUB_CHUNK = 128 << 10  # piece size: 128 KB beat 64 KB and 256 KB (cache fit)
 MAX_LINE = 256
 
 _fd = -1
@@ -100,9 +101,9 @@ def finish(j):
     for blobs in _results:
         part_lats, part_errors = marshal.loads(blobs[j])
         for key, packed in part_lats.items():
-            try:
+            if key in parts:
                 parts[key].append(packed)
-            except KeyError:
+            else:
                 parts[key] = [packed]
         for key, count in part_errors.items():
             errors[key] = errors.get(key, 0) + count
@@ -131,7 +132,7 @@ def spans(fd, size, parts):
             break
         bounds.append(pos + nl + 1)
     bounds.append(size)
-    return [(a, b) for a, b in zip(bounds, bounds[1:]) if a < b]
+    return [(a, b) for a, b in pairwise(bounds) if a < b]
 
 
 def main(data_dir="/data", out_dir="/out"):

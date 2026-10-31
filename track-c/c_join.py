@@ -20,7 +20,7 @@ REGIONS_FILE = "regions.csv"
 OUTPUT_FILE = "aggregates.txt"
 HEADER = b"id,name,note,region_id,amount"
 UNMATCHED = b"_UNMATCHED"
-PIECE = 1 << 20
+PIECE = 256 << 10  # piece size: 256 KB beat 512 KB and 1 MB (time and memory)
 SPLIT_MIN = 1 << 20
 
 # id, name, note, region_id, amount. Spec 2.2: a non-empty name or note is
