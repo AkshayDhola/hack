@@ -116,14 +116,15 @@ def parse_queries(data):
 
 def phrase_match(text, terms):
     """True if `terms` occur as consecutive tokens of a "<id>\t<text>" line's text (tokens
-    separated by runs of spaces)."""
+    separated by runs of spaces). Optimized: cache tab position, reduce attribute lookups."""
     first = terms[0]
+    first_len = len(first)
     end = len(text)
     start = text.find(b"\t") + 1
     pos = text.find(first, start)
     while pos >= 0:
         if pos == start or text[pos - 1] == 32:
-            j = pos + len(first)
+            j = pos + first_len
             for term in terms[1:]:
                 if j >= end or text[j] != 32:
                     break

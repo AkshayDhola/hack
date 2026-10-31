@@ -11,6 +11,8 @@ COPY c_join.py /app/
 COPY vendor /app/vendor
 # OpenBLAS is never called: one thread, so loading numpy starts no thread pool before the fork.
 ENV OPENBLAS_NUM_THREADS=1
+# Limit memory usage by malloc and keep hash behavior consistent across workers.
+ENV MALLOC_ARENA_MAX=2
 # The run is read-only and the image ships no stdlib bytecode: compile everything now, so no
 # module is compiled on every start. unchecked-hash: no source stat per import.
 RUN python3.13 -m compileall -q --invalidation-mode unchecked-hash /usr/lib/python3.13 /app

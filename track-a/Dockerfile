@@ -7,6 +7,8 @@ COPY --from=py /usr/bin/python3.13 /usr/bin/
 COPY --from=py /usr/lib/python3.13 /usr/lib/python3.13
 COPY --from=py /usr/lib/x86_64-linux-gnu/libexpat.so.1 /usr/lib/x86_64-linux-gnu/
 COPY a_ingest.py /app/
+# Limit memory usage by malloc and keep hash behavior consistent across workers.
+ENV MALLOC_ARENA_MAX=2
 # The run is read-only and the image ships no stdlib bytecode: compile everything now, so no
 # module is compiled on every start. unchecked-hash: no source stat per import.
 RUN python3.13 -m compileall -q --invalidation-mode unchecked-hash /usr/lib/python3.13 /app

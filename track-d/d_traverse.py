@@ -150,53 +150,59 @@ def build(j):
 
 
 def distance(s, t):
-    """Bidirectional Dijkstra: shortest s -> t distance, or -1 if t is unreachable."""
+    """Bidirectional Dijkstra: shortest s -> t distance, or -1 if t is unreachable.
+    Optimized: inline dict lookups and reduce attribute access."""
     if s == t:
         return 0
     fo, fe, bo, be = _csr
     shift = _shift
     mask = (1 << shift) - 1
-    df = {s: s}  # node -> best heap key (distance << shift | node) from s
-    db = {t: t}  # node -> best heap key to t
-    gf = df.get
-    gb = db.get
+    df = {s: 0}
+    db = {t: 0}
     hf = [s]
     hb = [t]
     mu = INF
+    heappush_f = heappush
+    heappop_f = heappop
     while hf and hb:
-        # Stop once no unsettled pair can beat mu (skipped until a path is known: -4%).
         if mu < INF and (hf[0] >> shift) + (hb[0] >> shift) >= mu:
             break
         if len(hf) <= len(hb):
-            x = heappop(hf)
+            x = heappop_f(hf)
             u = x & mask
-            if df[u] != x:
-                continue  # stale entry
-            base = x ^ u  # distance << shift: + edge gives the neighbour's key
+            d = x >> shift
+            if df[u] != d:
+                continue
+            base = x ^ u
             for e in fe[fo[u]:fo[u + 1]]:
                 k = base + e
                 v = e & mask
-                if k < gf(v, INF):
-                    df[v] = k
-                    heappush(hf, k)
-                    o = gb(v)
-                    if o is not None and (c := (k >> shift) + (o >> shift)) < mu:
-                        mu = c
+                nd = k >> shift
+                old = df.get(v)
+                if old is None or nd < old:
+                    df[v] = nd
+                    heappush_f(hf, k)
+                    odb = db.get(v)
+                    if odb is not None and nd + odb < mu:
+                        mu = nd + odb
         else:
-            x = heappop(hb)
+            x = heappop_f(hb)
             u = x & mask
-            if db[u] != x:
+            d = x >> shift
+            if db[u] != d:
                 continue
             base = x ^ u
             for e in be[bo[u]:bo[u + 1]]:
                 k = base + e
                 v = e & mask
-                if k < gb(v, INF):
-                    db[v] = k
-                    heappush(hb, k)
-                    o = gf(v)
-                    if o is not None and (c := (k >> shift) + (o >> shift)) < mu:
-                        mu = c
+                nd = k >> shift
+                old = db.get(v)
+                if old is None or nd < old:
+                    db[v] = nd
+                    heappush_f(hb, k)
+                    odf = df.get(v)
+                    if odf is not None and nd + odf < mu:
+                        mu = nd + odf
     return -1 if mu == INF else mu
 
 
