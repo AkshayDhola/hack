@@ -60,7 +60,8 @@ def work(span):
     """Phase 1: parse one file range -> per partition, marshalled ({key: packed latencies}, {key: 5xx})."""
     start, end = span
     lats = {}
-    errs = {}
+    # Slot zero holds the 5xx count; actual uint32 latencies follow it. Keep the
+    # group's state together and strip the count before sending packed latencies.
     rest = b""
     while start < end:
         n = min(SUB_CHUNK, end - start)
@@ -77,20 +78,22 @@ def work(span):
         for ts, _, ep, st, lat in zip(it, it, it, it, it):
             key = ts[:13] + ep
             try:
-                lats[key].append(int(lat))
+                values = lats[key]
             except KeyError:
-                lats[key] = array("I", [int(lat)])
+                values = lats[key] = array("I", [0])
+            values.append(int(lat))
             if st[0] == 53:  # ASCII '5': a 5xx status
-                errs[key] = errs.get(key, 0) + 1
+                values[0] += 1
 
     # Forked children share the parent's hash seed, so partitions agree across workers.
     lat_parts = [{} for _ in range(_workers)]
     err_parts = [{} for _ in range(_workers)]
-    for key, values in lats.items():
+    while lats:
+        key, values = lats.popitem()
         j = hash(key) % _workers
-        lat_parts[j][key] = values.tobytes()
-        if key in errs:
-            err_parts[j][key] = errs[key]
+        lat_parts[j][key] = memoryview(values)[1:].tobytes()
+        if values[0]:
+            err_parts[j][key] = values[0]
     return [marshal.dumps(p) for p in zip(lat_parts, err_parts)]
 
 
@@ -107,8 +110,10 @@ def finish(j):
                 parts[key] = [packed]
         for key, count in part_errors.items():
             errors[key] = errors.get(key, 0) + count
+        del part_lats, part_errors
     out = []
-    for key, packed in parts.items():
+    while parts:
+        key, packed = parts.popitem()
         values = array("I", b"".join(packed)).tolist()
         values.sort()
         n = len(values)
@@ -148,7 +153,8 @@ def main(data_dir="/data", out_dir="/out"):
         _results = []
         # Space (0x20) sorts below every endpoint byte, so sorting whole lines
         # gives the spec order: hour, then endpoint with a proper prefix first.
-        lines = b"".join(blobs).splitlines(keepends=True)
+        lines = [line for blob in blobs for line in blob.splitlines(keepends=True)]
+        del blobs
         lines.sort()
         output = b"".join(lines)
     os.close(_fd)

@@ -16,6 +16,9 @@ Two phases, each on a forked pool:
    the result is sorted), forks again so the joined postings are shared
    copy-on-write, and splits the distinct BOOL queries across workers: each one
    is evaluated exactly once, on whole-corpus sets.
+
+Range summaries use packed count/sum and ID buffers instead of retaining a
+separate tuple, list and Python ID objects for every query in every worker.
 """
 import gc
 import heapq
@@ -158,21 +161,7 @@ def index_range(span):
         # the id), looping in C.
         consume(map(array.append, map(postings_of, hits(line.split()[1:])), repeat(doc)))
     n = len(lines)
-    phrase_answers = []
-    # Stream phrase matches instead of allocating a potentially large list for
-    # every phrase. Candidate postings are in ascending document-ID order.
-    matches = phrase_match
-    for anchor, terms in _phrases:
-        count = 0
-        total = 0
-        smallest = []
-        for doc in lists[anchor]:
-            if matches(lines[doc - first], terms):
-                count += 1
-                total += doc
-                if len(smallest) < 10:
-                    smallest.append(doc)
-        phrase_answers.append((count, total, smallest))
+    phrase_answers = pack_answers(answer_phrases(lines, lists, first))
     del lines
     # Heavy queries have big sets: use one int per term as a bitset over this
     # range (bit k = doc first + k), so AND/OR/NOT run on machine words in C.
@@ -210,9 +199,36 @@ def index_range(span):
         block = 1 << b
         pattern = (bytes(block) + b"\xff" * block) * (nbytes // (2 * block) + 1)
         masks.append(int.from_bytes(pattern[:nbytes], "little"))
-    heavy_answers = [evaluate_bits(_bools[i], get, first, masks) for i in _heavy]
+    heavy_answers = pack_answers(evaluate_bits(_bools[i], get, first, masks) for i in _heavy)
     return phrase_answers, heavy_answers, {t: ids.tobytes()
                                           for t in _light_terms if (ids := lists[t])}
+
+
+def answer_phrases(lines, lists, first):
+    """Yield phrase summaries without retaining separate result objects per query."""
+    # Stream phrase matches instead of allocating a potentially large list for
+    # every phrase. Candidate postings are in ascending document-ID order.
+    matches = phrase_match
+    for anchor, terms in _phrases:
+        count = 0
+        total = 0
+        smallest = []
+        for doc in lists[anchor]:
+            if matches(lines[doc - first], terms):
+                count += 1
+                total += doc
+                if len(smallest) < 10:
+                    smallest.append(doc)
+        yield count, total, smallest
+
+
+def pack_answers(answers):
+    """Two buffers: uint64 count/sum pairs and min(count, 10) uint32 IDs per query."""
+    stats, ids = array("Q"), array("I")
+    for count, total, smallest in answers:
+        stats.extend((count, total))
+        ids.extend(smallest)
+    return stats.tobytes(), ids.tobytes()
 
 
 def use_counts(word_lists):
@@ -240,14 +256,16 @@ def evaluate_bits(words, get, first, masks):
             raise ValueError(f"unknown operator {op!r}")
     n = x.bit_count()
     total = first * n
-    for b, mask in enumerate(masks):
-        total += (x & mask).bit_count() << b
+    # At most ten matches: the IDs collected below already give the exact sum.
+    if n > 10:
+        for b, mask in enumerate(masks):
+            total += (x & mask).bit_count() << b
     smallest = []
     for _ in range(min(n, 10)):
         low = x & -x
         smallest.append(first + low.bit_length() - 1)
         x ^= low
-    return n, total, smallest
+    return n, total if n > 10 else sum(smallest), smallest
 
 
 def evaluate(words, get):
@@ -291,21 +309,28 @@ def answer_bools(indices):
 
 
 def combine(per_range, n):
-    """Per-range answers (ranges in id order) -> whole-corpus answers."""
+    """Packed per-range summaries (in ID order) -> whole-corpus answers."""
     if not per_range:
         return [(0, 0, [])] * n
+    ranges = [(memoryview(stats).cast("Q"), memoryview(ids).cast("I"))
+              for stats, ids in per_range]
+    positions = [0] * len(ranges)
     out = []
-    for answers in zip(*per_range):
+    for i in range(n):
         count = 0
         total = 0
         smallest = []
         # Ranges are ordered by document ID, so local top-10 lists can be
         # concatenated only until the global first 10 IDs have been collected.
-        for answer in answers:
-            count += answer[0]
-            total += answer[1]
+        for j, (stats, ids) in enumerate(ranges):
+            local_count = stats[2 * i]
+            count += local_count
+            total += stats[2 * i + 1]
+            take = min(local_count, 10)
             if len(smallest) < 10:
-                smallest.extend(answer[2][:10 - len(smallest)])
+                start = positions[j]
+                smallest.extend(ids[start:start + min(take, 10 - len(smallest))])
+            positions[j] += take
         out.append((count, total, smallest))
     return out
 

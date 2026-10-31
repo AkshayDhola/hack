@@ -79,8 +79,10 @@ def number(a, s, e):
     n = e - s
     v = np.zeros(len(s), np.int64)
     for k in range(int(n.max(initial=0))):
-        digit = a[np.maximum(e - 1 - k, 0)].astype(np.int64) - 48
-        v += np.where(n > k, digit * POW10[k], 0)
+        # Inactive rows may index an earlier field (or wrap within the piece).
+        # Their weight is zero; active rows always index an ASCII digit.
+        digit = a[e - 1 - k] - np.uint8(48)
+        v += digit * np.where(n > k, POW10[k], 0)
     return v
 
 
@@ -176,7 +178,11 @@ def work(span):
     totals = {int(c): [int(x[c]) for x in acc] for c in np.flatnonzero(acc[0])}
     # One \0-joined blob per country pickles far faster than a set of bytes.
     # Names are deduplicated once per country in phase 2, not in growing per-worker sets.
-    return totals, {c: b"\0".join(blobs) for c, blobs in names.items()}
+    packed = {}
+    while names:
+        c, blobs = names.popitem()
+        packed[c] = b"\0".join(blobs)
+    return totals, packed
 
 
 def count_names(keys):

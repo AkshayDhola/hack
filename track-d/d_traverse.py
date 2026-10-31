@@ -262,7 +262,7 @@ def main(data_dir="/data", out_dir="/out"):
         if q[0] != q[1] and q not in index:
             index[q] = len(index)
     _tasks = list(index)
-    answers = []
+    answers = [0] * len(queries)
     if _tasks:
         _per = -(-len(_tasks) // QUEUE_SLOTS)
         records = -(-len(_tasks) // _per)
@@ -275,7 +275,7 @@ def main(data_dir="/data", out_dir="/out"):
             for task, d in part:
                 found[task] = d
         os.close(_queue)
-        answers = [found[index[q]] if q in index else 0 for q in queries]
+        answers = (found[index[q]] if q in index else 0 for q in queries)
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, OUTPUT_FILE), "wb") as f:
