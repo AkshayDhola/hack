@@ -95,13 +95,16 @@ def spans(fd, start, end, parts):
 
 
 def parse(job):
-    """Phase 1: range c of edge lines -> its scratch slot, bucket after bucket; -> counts."""
+    """Phase 1: range c of edge lines -> its scratch slot, bucket after bucket; -> counts.
+    Optimized: cache divmod and reduce attribute lookups."""
     c, (start, end) = job
     size, shift = _span, _shift
     count = -(-_n // size)
     fk, fe, bk, be = ([array(code) for _ in range(count)] for code in "IQIQ")
     fka, fea, bka, bea = ([a.append for a in arrays] for arrays in (fk, fe, bk, be))
     rest = b""
+    json_loads = json.loads
+    buf_translate = COMMAS
     while start < end:
         n = min(PIECE, end - start)
         buf = rest + os.pread(_fd, n, start)
@@ -110,9 +113,15 @@ def parse(job):
         rest = buf[cut:]
         # json's C scanner builds the ints straight from the text: faster than split()
         # then int() on every token (-8% parse).
-        it = iter(json.loads(b"[%s]" % buf[:cut].translate(COMMAS).rstrip(b",")))
-        for u, v, w in zip(it, it, it):
-            w <<= shift
+        nums = json_loads(b"[%s]" % buf[:cut].translate(buf_translate).rstrip(b","))
+        # Direct index loop over the flat list, 3 at a time.
+        n_nums = len(nums)
+        i = 0
+        while i < n_nums:
+            u = nums[i]
+            v = nums[i + 1]
+            w = nums[i + 2] << shift
+            i += 3
             j, k = divmod(u, size)
             fka[j](k)
             fea[j](w | v)
@@ -151,7 +160,7 @@ def build(j):
 
 def distance(s, t):
     """Bidirectional Dijkstra: shortest s -> t distance, or -1 if t is unreachable.
-    Optimized: inline dict lookups and reduce attribute access."""
+    Optimized: inline dict lookups, reduce attribute access, cache heap operations."""
     if s == t:
         return 0
     fo, fe, bo, be = _csr
@@ -164,6 +173,8 @@ def distance(s, t):
     mu = INF
     heappush_f = heappush
     heappop_f = heappop
+    df_get = df.get
+    db_get = db.get
     while hf and hb:
         if mu < INF and (hf[0] >> shift) + (hb[0] >> shift) >= mu:
             break
@@ -178,13 +189,15 @@ def distance(s, t):
                 k = base + e
                 v = e & mask
                 nd = k >> shift
-                old = df.get(v)
+                old = df_get(v)
                 if old is None or nd < old:
                     df[v] = nd
                     heappush_f(hf, k)
-                    odb = db.get(v)
+                    odb = db_get(v)
                     if odb is not None and nd + odb < mu:
                         mu = nd + odb
+                        df_get = df.get  # refresh after dict mutation
+                        db_get = db.get
         else:
             x = heappop_f(hb)
             u = x & mask
@@ -196,13 +209,15 @@ def distance(s, t):
                 k = base + e
                 v = e & mask
                 nd = k >> shift
-                old = db.get(v)
+                old = db_get(v)
                 if old is None or nd < old:
                     db[v] = nd
                     heappush_f(hb, k)
-                    odf = df.get(v)
+                    odf = df_get(v)
                     if odf is not None and nd + odf < mu:
                         mu = nd + odf
+                        df_get = df.get  # refresh after dict mutation
+                        db_get = db.get
     return -1 if mu == INF else mu
 
 

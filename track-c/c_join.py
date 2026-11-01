@@ -75,19 +75,22 @@ def last_record_start(buf):
 
 
 def number(a, s, e):
-    """Decimal digits a[s:e] -> int64 per row, right to left: one gather per digit place."""
+    """Decimal digits a[s:e] -> int64 per row, right to left: one gather per digit place.
+    Optimized: cache POW10 lookup and reduce attribute access."""
     n = e - s
     v = np.zeros(len(s), np.int64)
-    for k in range(int(n.max(initial=0))):
+    max_n = int(n.max(initial=0))
+    for k in range(max_n):
         # Inactive rows may index an earlier field (or wrap within the piece).
         # Their weight is zero; active rows always index an ASCII digit.
-        digit = a[e - 1 - k] - np.uint8(48)
+        digit = a[e - 1 - k] - 48
         v += digit * np.where(n > k, POW10[k], 0)
     return v
 
 
 def scan(piece, table, acc, names):
-    """Whole records -> per-country stats added into acc, inner name bytes into names."""
+    """Whole records -> per-country stats added into acc, inner name bytes into names.
+    Optimized: reduce numpy attribute lookups and temporary allocations."""
     a = np.frombuffer(piece, np.uint8)
     # Quotes so far. Spec 2.1: a quote only occurs in a quoted field, so a byte is
     # outside quotes when the count is even. uint16 wraps, harmlessly: only the parity
@@ -108,7 +111,8 @@ def scan(piece, table, acc, names):
     cents = number(a, c3 + 1 + neg, end - 3) * 100 + number(a, end - 2, end)
     cents = np.where(neg, -cents, cents)
     region = number(a, c2 + 1, c3)
-    key = np.where(region < len(table), table[np.minimum(region, len(table) - 1)], 0)
+    table_len = len(table)
+    key = np.where(region < table_len, table[np.minimum(region, table_len - 1)], 0)
     key = key.astype(np.intp)
 
     def unescaped(s, e):  # quoted: minus both delimiters and one byte per "" pair
@@ -133,8 +137,9 @@ def scan(piece, table, acc, names):
     idx[ends - 1] = len(a)  # each \0: the zero byte appended below
     blob = np.append(a, np.uint8(0))[idx].tobytes()
     cuts = [0, *(np.flatnonzero(key[1:] != key[:-1]) + 1).tolist(), len(key)]
+    names_setdefault = names.setdefault
     for i, j in zip(cuts, cuts[1:]):
-        names.setdefault(int(key[i]), []).append(blob[ends[i] - size[i] : ends[j - 1] - 1])
+        names_setdefault(int(key[i]), []).append(blob[ends[i] - size[i] : ends[j - 1] - 1])
 
 
 def merge(totals, part):

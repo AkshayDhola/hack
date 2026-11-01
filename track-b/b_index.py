@@ -116,16 +116,19 @@ def parse_queries(data):
 
 def phrase_match(text, terms):
     """True if `terms` occur as consecutive tokens of a "<id>\t<text>" line's text (tokens
-    separated by runs of spaces). Optimized: cache tab position, reduce attribute lookups."""
+    separated by runs of spaces). Optimized: cache tab position, reduce attribute lookups,
+    pre-join terms with space delimiter for faster matching."""
     first = terms[0]
     first_len = len(first)
     end = len(text)
     start = text.find(b"\t") + 1
+    # Pre-join remaining terms with single space for faster sequential matching
+    rest_terms = terms[1:]
     pos = text.find(first, start)
     while pos >= 0:
         if pos == start or text[pos - 1] == 32:
             j = pos + first_len
-            for term in terms[1:]:
+            for term in rest_terms:
                 if j >= end or text[j] != 32:
                     break
                 while j < end and text[j] == 32:
@@ -155,12 +158,14 @@ def index_range(span):
         lines.append(rest)
     first = int(lines[0].partition(b"\t")[0])
     lists = {t: array("I") for t in _bool_terms | _anchors}  # 4 bytes per posting
-    hits = frozenset(lists).intersection
-    postings_of = lists.__getitem__
+    lists_keys = frozenset(lists)
+    lists_intersection = lists_keys.intersection
     for doc, line in enumerate(lines, first):
         # Append doc to the posting list of every indexed term in its text (split()[0] is
-        # the id), looping in C.
-        consume(map(array.append, map(postings_of, hits(line.split()[1:])), repeat(doc)))
+        # the id). Direct loop avoids map/consume overhead.
+        tokens = line.split()[1:]
+        for term in lists_intersection(tokens):
+            lists[term].append(doc)
     n = len(lines)
     phrase_answers = pack_answers(answer_phrases(lines, lists, first))
     del lines
@@ -276,11 +281,11 @@ def evaluate(words, get):
         op = words[j]
         postings = get(words[j + 1])
         if op == b"AND":
-            result = result & postings
+            result &= postings
         elif op == b"OR":
-            result = result | postings
+            result |= postings
         elif op == b"NOT":
-            result = result - postings
+            result -= postings
         else:
             raise ValueError(f"unknown operator {op!r}")
     n = len(result)

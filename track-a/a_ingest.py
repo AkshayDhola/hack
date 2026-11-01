@@ -63,6 +63,8 @@ def work(span):
     # Slot zero holds the 5xx count; actual uint32 latencies follow it. Keep the
     # group's state together and strip the count before sending packed latencies.
     rest = b""
+    lats_setdefault = lats.setdefault
+    array_I = array("I", [0])
     while start < end:
         n = min(SUB_CHUNK, end - start)
         buf = rest + os.pread(_fd, n, start)
@@ -70,18 +72,22 @@ def work(span):
         # Cut after the last full line; the final range keeps an unterminated last line.
         cut = buf.rfind(b"\n") + 1 if start < end else len(buf)
         rest = buf[cut:]
-        it = iter(buf[:cut].split())
+        tokens = buf[:cut].split()
         del buf
         # Fields: timestamp, method, endpoint, status, latency; the first 13 timestamp
         # bytes are the hour. Each latency goes straight into its key's array: no
         # per-piece lists to build and convert (-15%).
-        for ts, _, ep, st, lat in zip(it, it, it, it, it):
-            key = ts[:13] + ep
-            try:
-                values = lats[key]
-            except KeyError:
+        # Unroll the zip(it,it,it,it,it) pattern into a direct index loop over tokens.
+        n_tokens = len(tokens)
+        i = 0
+        while i < n_tokens:
+            key = tokens[i][:13] + tokens[i + 2]
+            i += 5
+            values = lats.get(key)
+            if values is None:
                 values = lats[key] = array("I", [0])
-            values.append(int(lat))
+            values.append(int(tokens[i - 1]))
+            st = tokens[i - 2]
             if st[0] == 53:  # ASCII '5': a 5xx status
                 values[0] += 1
 
@@ -104,10 +110,11 @@ def finish(j):
     for blobs in _results:
         part_lats, part_errors = marshal.loads(blobs[j])
         for key, packed in part_lats.items():
-            if key in parts:
-                parts[key].append(packed)
-            else:
+            parts_list = parts.get(key)
+            if parts_list is None:
                 parts[key] = [packed]
+            else:
+                parts_list.append(packed)
         for key, count in part_errors.items():
             errors[key] = errors.get(key, 0) + count
         del part_lats, part_errors
